@@ -1,5 +1,8 @@
-#include <openssl/ssl.h>
+#include "cssl.h"
+#include <unistd.h>
 #include <openssl/err.h>
+#include <openssl/x509.h>
+#include <openssl/rand.h>
 
 //#include <stdio.h>
 //main()
@@ -23,24 +26,18 @@ typedef void  (*cssl_free_fun) (void* ptr);
 cssl_alloc_fun cssl_alloc =  malloc;
 cssl_free_fun  cssl_free =  free;
 
-typedef enum CSSL_VERSION
-{
-    CSSL_VERSION_1=0;
-}CSSL_VERSION;
+//typedef enum CSSL_VERSION
+//{
+//    CSSL_VERSION_1=0
+//}CSSL_VERSION;
 
-typedef struct cssl
-{
-    SSL_CTX *ctx;
-    SSL *ssl;
-    
-}cssl;
 
 void cssl_cert_print(cssl* ssl);
 
 int cssl_init()
 {
     (void)SSL_library_init();
-    //(void)OpenSSL_add_all_algorithms();
+    (void)OpenSSL_add_all_algorithms();
     (void)SSL_load_error_strings();
     (void)RAND_poll();
     
@@ -64,15 +61,7 @@ cssl* cssl_client_open()
         return NULL;
     }
     
-    ssl->ssl = SSL_new(ssl->ctx);
-    if(NULL == ssl->ssl)
-    {
-        SSL_CTX_free(ssl->ctx);
-        ssl->ctx = NULL;
-        cssl_free(ssl);
-        printf("cssl_open create ssl error\n");
-        return NULL;
-    }
+    ssl->ssl = NULL;
     
     return ssl;
 }
@@ -108,18 +97,37 @@ cssl* cssl_server_open()
     return ssl;
 }
 
-void cssl_set_fd(cssl* ssl, int fd)
+//如何并发,一个ctx是否可以设置多个fd
+int cssl_set_fd(cssl* ssl, int fd)
 {
+    ssl->ssl = SSL_new(ssl->ctx);
+    if(NULL == ssl->ssl)
+    {
+        return -1;
+    }
     SSL_set_fd(ssl->ssl, fd);
+    
+    return 0;
 }
 
 void cssl_close(cssl* ssl)
 {
-    SSL_shutdown(ssl->ssl);
-    SSL_CTX_free(ssl->ctx);
-    ssl->ctx = NULL;
-    SSL_free(ssl->ssl);
-    ssl->ssl = NULL;
+    if(NULL == ssl)
+    {
+        return;
+    }
+    if(NULL != ssl->ssl)
+    {
+        SSL_shutdown(ssl->ssl);
+        SSL_free(ssl->ssl);
+        ssl->ssl = NULL;
+    }
+    if(NULL != ssl->ctx)
+    {
+        SSL_CTX_free(ssl->ctx);
+        ssl->ctx = NULL;
+    }
+    
     cssl_free(ssl);
     ssl = NULL;
 }
@@ -146,10 +154,18 @@ int cssl_read(cssl* ssl, void* buffer, int size)
 
 int cssl_write(cssl* ssl, void* buffer, int size)
 {
-    int len;
-    len = SSL_write(ssl->ssl, buffer, size);
+    int ret, err;
+    do
+    {
+        ret = SSL_write(ssl->ssl, buffer, size);
+        if(ret > 0 || EAGAIN == errno)
+        {
+            break;
+        }
+        err = SSL_get_error(ssl->ssl, ret);
+    }while(SSL_ERROR_WANT_WRITE == err || SSL_ERROR_WANT_READ == err);
     
-    return 0;
+    return ret;
 }
 
 void cssl_getcwd(char* pwd, int size)
@@ -175,23 +191,29 @@ int cssl_connect(cssl* ssl)
 
 int cssl_accept(cssl* ssl)
 {
-    if (SSL_accept(ssl) < 0)
+    if (SSL_accept(ssl->ssl) < 0)
     {
       return -1;
     }
     return 0;
 }
 
-void cssl_set_cipher(cssl* ssl, cipherlist)
+void cssl_set_cipher(cssl* ssl, char* cipherlist)
 {
     //set cipher ,when handshake client will send the cipher list to server  
     (void)SSL_CTX_set_cipher_list(ssl->ctx, cipherlist); //"HIGH:MEDIA:LOW:!DH"
 }
 
+int cssl_passwd_cb(char* buf, int size, int rwflag, void* userdata)
+{
+    strncpy(buf, userdata, strlen((char*)userdata));
+}
+
 void cssl_set_key_password(cssl* ssl, char* passwd)
 {
-    //passwd is supplied to protect the private key,when you want to read key  
-    (void)SSL_CTX_set_default_passwd_cb_userdata(ssl->ctx, passwd);  
+    //passwd is supplied to protect the private key,when you want to read key
+    (void)SSL_CTX_set_default_passwd_cb_userdata(ssl->ctx, passwd);
+    (void)SSL_CTX_set_default_passwd_cb(ssl->ctx, cssl_passwd_cb);
 }
 
 
@@ -210,7 +232,7 @@ static int cssl_verify_cb(int res, X509_STORE_CTX *xs)
     return res;
 }
 
-void cssl_set_verify(cssl* ssl, char* cafile)
+void cssl_set_ca(cssl* ssl, char* cafile)
 {
     //set verify ,when recive the server certificate and verify it
     //and verify_cb function will deal the result of verification
@@ -223,14 +245,9 @@ void cssl_set_verify(cssl* ssl, char* cafile)
     SSL_CTX_load_verify_locations(ssl->ctx, cafile, NULL);
 }
 
-int cssl_set_cert_key(cssl* ssl, char* certfile, char* keyfile)
+int cssl_set_key(cssl* ssl, char* keyfile, char* passwd)
 {
-    //load user certificate,this cert will be send to server for server verify
-    if(SSL_CTX_use_certificate_file(ssl->ctx, certfile, SSL_FILETYPE_PEM) <= 0){
-        ERR_print_errors_fp(stdout);
-        printf("cssl_set_cert_key load certificate file error!\n");
-        return -1;
-    }
+    cssl_set_key_password(ssl, passwd);
     //load user private key
     if(SSL_CTX_use_PrivateKey_file(ssl->ctx, keyfile, SSL_FILETYPE_PEM) <= 0){
         ERR_print_errors_fp(stdout);
@@ -245,6 +262,17 @@ int cssl_set_cert_key(cssl* ssl, char* certfile, char* keyfile)
     return 0;
 }
 
+int cssl_set_cert(cssl* ssl, char* certfile)
+{
+    //load user certificate,this cert will be send to server for server verify
+    if(SSL_CTX_use_certificate_file(ssl->ctx, certfile, SSL_FILETYPE_PEM) <= 0){ //SSL_FILETYPE_ASN1
+        ERR_print_errors_fp(stdout);
+        printf("cssl_set_cert_key load certificate file error!\n");
+        return -1;
+    }
+    return 0;
+}
+
 void cssl_cert_print(cssl* ssl)
 {
     X509 *cert;
@@ -253,7 +281,7 @@ void cssl_cert_print(cssl* ssl)
     {
         return;
     }
-    cert = SSL_get_peer_certificate(ssl);
+    cert = SSL_get_peer_certificate(ssl->ssl);
     if (cert != NULL) {
         printf("Digital certificate information:\n");
         line = X509_NAME_oneline(X509_get_subject_name(cert), 0, 0);
@@ -270,40 +298,40 @@ void cssl_cert_print(cssl* ssl)
     }
 }
 
-void print_client_cert(char* path)  
+void print_client_cert(char* path, char* passwd)
 {  
-    X509 *cert =NULL;  
-    FILE *fp = NULL;  
-    fp = fopen(path,"rb");  
-    //从证书文件中读取证书到x509结构中，passwd为1111,此为生成证书时设置的  
-    cert = PEM_read_X509(fp, NULL, NULL, "1111");  
-    X509_NAME *name=NULL;  
-    char buf[8192]={0};  
-    BIO *bio_cert = NULL;  
-    //证书持有者信息  
-    name = X509_get_subject_name(cert);  
-    X509_NAME_oneline(name,buf,8191);  
-    printf("ClientSubjectName:%s\n",buf);  
-    memset(buf,0,sizeof(buf));  
-    bio_cert = BIO_new(BIO_s_mem());  
-    PEM_write_bio_X509(bio_cert, cert);  
-    //证书内容  
-    BIO_read( bio_cert, buf, 8191);  
-    printf("CLIENT CERT:\n%s\n",buf);  
-    if(bio_cert)BIO_free(bio_cert);  
-    fclose(fp);  
-    if(cert) X509_free(cert);  
+    X509 *cert =NULL;
+    FILE *fp = NULL;
+    fp = fopen(path,"rb");
+    //从证书文件中读取证书到x509结构中，passwd为1111,此为生成证书时设置的
+    cert = PEM_read_X509(fp, NULL, NULL, passwd);
+    X509_NAME *name=NULL;
+    char buf[8192]={0};
+    BIO *bio_cert = NULL;
+    //证书持有者信息
+    name = X509_get_subject_name(cert);
+    X509_NAME_oneline(name,buf,8191);
+    printf("ClientSubjectName:%s\n",buf);
+    memset(buf,0,sizeof(buf));
+    bio_cert = BIO_new(BIO_s_mem());
+    PEM_write_bio_X509(bio_cert, cert);
+    //证书内容
+    BIO_read( bio_cert, buf, 8191);
+    printf("CLIENT CERT:\n%s\n",buf);
+    if(bio_cert)BIO_free(bio_cert);
+    fclose(fp);
+    if(cert) X509_free(cert);
 }
 
 //打印服务端证书相关内容  
-void print_peer_certificate(SSL *ssl)  
+void print_peer_cert(cssl* ssl)
 {  
     X509* cert= NULL;
     X509_NAME *name=NULL;
     char buf[8192]={0};
     BIO *bio_cert = NULL;
     //获取server端证书
-    cert = SSL_get_peer_certificate(ssl);
+    cert = SSL_get_peer_certificate(ssl->ssl);
     //获取证书拥有者信息
     name = X509_get_subject_name(cert);
     X509_NAME_oneline(name,buf,8191);
